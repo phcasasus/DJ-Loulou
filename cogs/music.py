@@ -11,6 +11,7 @@ import re
 import shutil
 from collections import deque
 from dataclasses import asdict, dataclass
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 import discord
@@ -42,9 +43,8 @@ YTDL_PLAY_OPTS = {
 }
 
 # Opcoes para enfileirar: lista playlists rapido (sem resolver cada video).
-# Com noplaylist=True, um link de VIDEO que carrega um Mix/radio junto (&list=RD..., start_radio=1)
-# toca apenas o video; ja um link de PLAYLIST explicita (youtube.com/playlist?list=...)
-# entra inteira, limitada a PLAYLIST_MAX musicas.
+# Com noplaylist=True, so um link de PLAYLIST (youtube.com/playlist?list=...) entra inteira,
+# limitado a PLAYLIST_MAX musicas. Links de video com &list= sao tratados por link_da_playlist().
 YTDL_QUEUE_OPTS = {**YTDL_PLAY_OPTS, "extract_flat": "in_playlist", "playlistend": PLAYLIST_MAX}
 
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
@@ -56,6 +56,27 @@ COR_EMBED = discord.Color.from_rgb(255, 73, 108)
 def _extract(opts: dict, query: str) -> dict:
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(query, download=False)
+
+
+def link_da_playlist(url: str) -> str | None:
+    """Se o link for um video do YouTube com &list= de uma playlist real, retorna o link da playlist.
+
+    O YouTube nao usa um link proprio quando voce toca uma playlist: ele abre o video
+    com &list=<id> no final. Convertemos para youtube.com/playlist?list=<id> para a
+    fila receber todas as musicas. IDs comecando com "RD" sao Mix/radio (lista infinita
+    gerada automaticamente) e "WL" e o Watch Later: nesses casos toca so o video.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not (host.endswith("youtube.com") or host == "youtu.be"):
+        return None
+    list_id = parse_qs(parsed.query).get("list", [""])[0]
+    if not list_id or list_id.startswith("RD") or list_id == "WL":
+        return None
+    return f"https://www.youtube.com/playlist?list={list_id}"
 
 
 def _find_ffmpeg() -> str:
@@ -441,6 +462,11 @@ class Music(commands.Cog):
             await voice.channel.connect(self_deaf=True)
         elif vc.channel != voice.channel:
             await vc.move_to(voice.channel)
+
+        if busca.startswith(("http://", "https://")):
+            playlist = link_da_playlist(busca)
+            if playlist:
+                busca = playlist
 
         try:
             info = await asyncio.to_thread(_extract, YTDL_QUEUE_OPTS, busca)
