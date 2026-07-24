@@ -9,6 +9,7 @@ import os
 import random
 import re
 import shutil
+import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from urllib.parse import parse_qs, urlparse
@@ -24,6 +25,8 @@ log = logging.getLogger("djloulou.music")
 IDLE_TIMEOUT = 300  # segundos sem nada na fila ate o bot sair do canal
 ALONE_TIMEOUT = 60  # segundos sozinho no canal de voz ate o bot sair
 PLAYLIST_MAX = 100  # maximo de musicas adicionadas de uma playlist de uma vez
+STALL_TIMEOUT = 15  # segundos sem o FFmpeg produzir audio ate considerar travado
+LIVE_RECONNECT_MAX = 5  # falhas seguidas ao reconectar numa live antes de desistir
 
 # Fila salva em disco para sobreviver a reinicios do bot/PC
 STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "queue_state.json")
@@ -48,6 +51,10 @@ YTDL_PLAY_OPTS = {
 YTDL_QUEUE_OPTS = {**YTDL_PLAY_OPTS, "extract_flat": "in_playlist", "playlistend": PLAYLIST_MAX}
 
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+# Live e HLS (.m3u8): as flags -reconnect valem so para download HTTP direto e podem
+# prender o FFmpeg re-baixando segmento vencido. A recuperacao de live fica por conta
+# do watchdog do player, que mata o processo e reconecta com um link novo.
+FFMPEG_BEFORE_LIVE = None
 FFMPEG_OPTS = "-vn"
 
 COR_EMBED = discord.Color.from_rgb(255, 73, 108)
@@ -56,6 +63,11 @@ COR_EMBED = discord.Color.from_rgb(255, 73, 108)
 def _extract(opts: dict, query: str) -> dict:
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(query, download=False)
+
+
+def _is_live(info: dict) -> bool:
+    """True se o resultado do yt-dlp e uma transmissao ao vivo."""
+    return bool(info.get("is_live")) or info.get("live_status") == "is_live"
 
 
 def link_da_playlist(url: str) -> str | None:
@@ -148,6 +160,30 @@ class Track:
     title: str
     duration: int | None
     requested_by: str
+    is_live: bool = False
+
+
+def fmt_track_duration(track: Track) -> str:
+    return "🔴 AO VIVO" if track.is_live else fmt_duration(track.duration)
+
+
+class WatchedAudio(discord.PCMVolumeTransformer):
+    """Fonte de audio que registra quando o FFmpeg entregou audio pela ultima vez.
+
+    Quando um stream engasga (comum em live), o FFmpeg pode ficar mudo sem encerrar,
+    e o player ficaria esperando para sempre. O watchdog usa last_read para detectar
+    isso e destravar via cleanup() - vc.stop() sozinho nao mata o processo travado.
+    """
+
+    def __init__(self, original: discord.AudioSource, volume: float):
+        super().__init__(original, volume)
+        self.last_read = time.monotonic()
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data:
+            self.last_read = time.monotonic()
+        return data
 
 
 class PlayerControls(discord.ui.View):
@@ -180,7 +216,7 @@ class PlayerControls(discord.ui.View):
         if vc is None or (not vc.is_playing() and not vc.is_paused()):
             return await interaction.response.send_message("Nada tocando.", ephemeral=True)
         self.player._skipping = True
-        vc.stop()
+        self.player.stop_current()
         await interaction.response.send_message(f"{interaction.user.display_name} pulou a musica.")
 
     @discord.ui.button(emoji="\N{BLACK SQUARE FOR STOP}", label="Parar", style=discord.ButtonStyle.secondary)
@@ -191,7 +227,7 @@ class PlayerControls(discord.ui.View):
         self.player.queue.clear()
         self.player.loop_mode = "off"
         self.player._skipping = True
-        vc.stop()
+        self.player.stop_current()
         self.player.cog.save_states()
         await interaction.response.send_message(f"{interaction.user.display_name} parou e limpou a fila.")
 
@@ -209,6 +245,8 @@ class MusicPlayer:
         self.volume = 0.5
         self.loop_mode = "off"  # off | musica | fila
         self._skipping = False
+        self._expected_kill = False  # matamos o FFmpeg de proposito: nao logar como erro
+        self._source: WatchedAudio | None = None
         self._last_announced: Track | None = None
         self._now_msg: discord.Message | None = None
         self._now_view: PlayerControls | None = None
@@ -238,6 +276,19 @@ class MusicPlayer:
             "loop_mode": self.loop_mode,
         }
 
+    def stop_current(self):
+        """Para a faixa atual de verdade: mata o FFmpeg alem do vc.stop().
+
+        Se o FFmpeg estiver travado (live que engasgou), vc.stop() sozinho nao o
+        encerra - a thread de audio fica presa lendo um processo mudo para sempre.
+        """
+        vc = self.guild.voice_client
+        if vc:
+            vc.stop()
+        if self._source is not None:
+            self._expected_kill = True
+            self._source.cleanup()
+
     async def _player_loop(self):
         while True:
             while not self.queue:
@@ -252,55 +303,117 @@ class MusicPlayer:
             track = self.queue.popleft()
             self.current = track
             self.cog.save_states()
+            self._skipping = False
 
-            try:
-                info = await asyncio.to_thread(_extract, YTDL_PLAY_OPTS, track.url)
-                if "entries" in info:
-                    info = info["entries"][0]
-            except Exception as exc:
-                await self._announce(f"Nao consegui tocar **{short_title(track.title)}**, pulando. (`{exc}`)")
-                self.current = None
-                self.cog.save_states()
-                continue
+            inicio = time.monotonic()
+            resultado = await self._play_track(track, anunciar=True)
 
-            track.title = info.get("title") or track.title
-            track.duration = info.get("duration") or track.duration
-            stream_url = info["url"]
+            # Live engasga/cai de tempos em tempos: reconecta sozinho com um link
+            # novo, sem reanunciar. Se falhar varias vezes seguidas, desiste.
+            tentativas = 0
+            while (
+                resultado in ("fim", "travou")
+                and track.is_live
+                and not self._skipping
+                and self.guild.voice_client is not None
+            ):
+                if time.monotonic() - inicio > 60:
+                    tentativas = 0  # tocou um bom tempo: zera a conta de falhas seguidas
+                tentativas += 1
+                if tentativas > LIVE_RECONNECT_MAX:
+                    await self._announce(
+                        f"A live **{short_title(track.title)}** parece ter encerrado ou caido. Parei de reconectar."
+                    )
+                    break
+                log.info("Live '%s' parou (%s); reconectando (tentativa %d).", track.title, resultado, tentativas)
+                await asyncio.sleep(2 * tentativas)
+                if self._skipping or self.guild.voice_client is None:
+                    break
+                inicio = time.monotonic()
+                resultado = await self._play_track(track, anunciar=False)
 
-            vc = self.guild.voice_client
-            if vc is None or not vc.is_connected():
+            if resultado == "sem_voz":
                 await self.destroy(None)
                 return
 
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(
-                    stream_url,
-                    executable=self.cog.ffmpeg,
-                    before_options=FFMPEG_BEFORE,
-                    options=FFMPEG_OPTS,
-                ),
-                volume=self.volume,
-            )
-            self._song_done.clear()
-            self._skipping = False
-            vc.play(source, after=self._on_song_end)
-
-            if not (self.loop_mode == "musica" and track is self._last_announced):
-                self._last_announced = track
-                await self._announce_now_playing(track)
-
-            await self._song_done.wait()
-
-            if self.loop_mode == "musica" and not self._skipping:
-                self.queue.appendleft(track)
-            elif self.loop_mode == "fila":
-                self.queue.append(track)
+            if resultado != "erro":
+                if self.loop_mode == "musica" and not self._skipping:
+                    self.queue.appendleft(track)
+                elif self.loop_mode == "fila":
+                    self.queue.append(track)
             self.current = None
             self.cog.save_states()
 
+    async def _play_track(self, track: Track, anunciar: bool) -> str:
+        """Resolve o stream e toca a faixa ate o fim.
+
+        Retorna "fim" (terminou/foi parada), "travou" (FFmpeg ficou mudo e o watchdog
+        o matou), "erro" (nao resolveu o stream) ou "sem_voz" (bot fora do canal).
+        """
+        try:
+            info = await asyncio.to_thread(_extract, YTDL_PLAY_OPTS, track.url)
+            if "entries" in info:
+                info = info["entries"][0]
+        except Exception as exc:
+            await self._announce(f"Nao consegui tocar **{short_title(track.title)}**, pulando. (`{exc}`)")
+            return "erro"
+
+        track.title = info.get("title") or track.title
+        track.duration = info.get("duration") or track.duration
+        track.is_live = _is_live(info)
+        stream_url = info["url"]
+
+        vc = self.guild.voice_client
+        if vc is None or not vc.is_connected():
+            return "sem_voz"
+
+        source = WatchedAudio(
+            discord.FFmpegPCMAudio(
+                stream_url,
+                executable=self.cog.ffmpeg,
+                before_options=FFMPEG_BEFORE_LIVE if track.is_live else FFMPEG_BEFORE,
+                options=FFMPEG_OPTS,
+            ),
+            volume=self.volume,
+        )
+        self._source = source
+        self._song_done.clear()
+        self._expected_kill = False
+        vc.play(source, after=self._on_song_end)
+
+        if anunciar and not (self.loop_mode == "musica" and track is self._last_announced):
+            self._last_announced = track
+            await self._announce_now_playing(track)
+
+        # Espera a faixa acabar, checando periodicamente se o FFmpeg travou
+        # (processo vivo, mas sem produzir audio ha STALL_TIMEOUT segundos).
+        try:
+            while True:
+                try:
+                    async with asyncio.timeout(STALL_TIMEOUT):
+                        await self._song_done.wait()
+                    return "fim"
+                except TimeoutError:
+                    vc = self.guild.voice_client
+                    if vc is not None and vc.is_paused():
+                        source.last_read = time.monotonic()  # pausa nao e travamento
+                        continue
+                    if time.monotonic() - source.last_read < STALL_TIMEOUT:
+                        continue
+                    log.warning("FFmpeg mudo ha %ds em '%s'; matando o processo.", STALL_TIMEOUT, track.title)
+                    self._expected_kill = True
+                    source.cleanup()  # destrava a thread de audio e dispara o after
+                    await self._song_done.wait()
+                    return "travou"
+        finally:
+            self._source = None
+
     def _on_song_end(self, error):
         if error:
-            log.error("Erro na reproducao: %s", error)
+            if self._expected_kill:
+                log.info("FFmpeg encerrado de proposito (skip/stop/watchdog): %s", error)
+            else:
+                log.error("Erro na reproducao: %s", error)
         self.bot.loop.call_soon_threadsafe(self._song_done.set)
 
     async def _announce(self, message: str):
@@ -328,7 +441,7 @@ class MusicPlayer:
             description=f"[{short_title(track.title)}]({track.url})",
             color=COR_EMBED,
         )
-        embed.add_field(name="Duracao", value=fmt_duration(track.duration))
+        embed.add_field(name="Duracao", value=fmt_track_duration(track))
         embed.add_field(name="Pedida por", value=track.requested_by)
         self._now_view = PlayerControls(self)
         try:
@@ -343,6 +456,9 @@ class MusicPlayer:
         self.current = None
         self.cog.save_states()
         await self._clear_controls()
+        if self._source is not None:
+            self._expected_kill = True
+            self._source.cleanup()  # mata o FFmpeg mesmo se estiver travado
         vc = self.guild.voice_client
         if vc:
             try:
@@ -484,10 +600,11 @@ class Music(commands.Cog):
             for e in entries:
                 url = e.get("url") or e.get("webpage_url")
                 if url:
-                    tracks.append(Track(url, e.get("title") or "Sem titulo", e.get("duration"), requester))
+                    tracks.append(Track(url, e.get("title") or "Sem titulo", e.get("duration"),
+                                        requester, is_live=_is_live(e)))
         elif info:
             tracks.append(Track(info.get("webpage_url") or busca, info.get("title") or "Sem titulo",
-                                info.get("duration"), requester))
+                                info.get("duration"), requester, is_live=_is_live(info)))
 
         if not tracks:
             return await interaction.followup.send("Nao encontrei nada com isso.")
@@ -509,7 +626,7 @@ class Music(commands.Cog):
                 description=f"[{short_title(t.title)}]({t.url})",
                 color=COR_EMBED,
             )
-            embed.add_field(name="Duracao", value=fmt_duration(t.duration))
+            embed.add_field(name="Duracao", value=fmt_track_duration(t))
             embed.add_field(name="Posicao na fila", value="1" if proxima else str(len(player.queue)))
         await interaction.followup.send(embed=embed)
 
@@ -553,7 +670,7 @@ class Music(commands.Cog):
         if not player:
             return
         player._skipping = True
-        vc.stop()
+        player.stop_current()
         await interaction.response.send_message("Pulando...")
 
     @app_commands.command(name="stop", description="Para de tocar e limpa a fila (o bot continua no canal)")
@@ -564,7 +681,7 @@ class Music(commands.Cog):
         player.queue.clear()
         player.loop_mode = "off"
         player._skipping = True
-        vc.stop()
+        player.stop_current()
         player.cog.save_states()
         await interaction.response.send_message("Parei e limpei a fila.")
 
@@ -576,11 +693,11 @@ class Music(commands.Cog):
         linhas = []
         if player.current:
             c = player.current
-            linhas.append(f"**Tocando agora:** [{short_title(c.title)}]({c.url}) `{fmt_duration(c.duration)}`")
+            linhas.append(f"**Tocando agora:** [{short_title(c.title)}]({c.url}) `{fmt_track_duration(c)}`")
         if player.queue:
             linhas.append(f"\n**Proximas ({len(player.queue)}):**")
             for i, t in enumerate(list(player.queue)[:10], start=1):
-                linhas.append(f"`{i}.` [{short_title(t.title)}]({t.url}) `{fmt_duration(t.duration)}`")
+                linhas.append(f"`{i}.` [{short_title(t.title)}]({t.url}) `{fmt_track_duration(t)}`")
             resto = len(player.queue) - 10
             if resto > 0:
                 linhas.append(f"... e mais {resto} musica(s)")
@@ -668,7 +785,7 @@ class Music(commands.Cog):
             return await interaction.response.send_message("Nada tocando agora.", ephemeral=True)
         t = player.current
         embed = discord.Embed(title="Tocando agora", description=f"[{short_title(t.title)}]({t.url})", color=COR_EMBED)
-        embed.add_field(name="Duracao", value=fmt_duration(t.duration))
+        embed.add_field(name="Duracao", value=fmt_track_duration(t))
         embed.add_field(name="Pedida por", value=t.requested_by)
         embed.add_field(name="Volume", value=f"{int(player.volume * 100)}%")
         if player.loop_mode != "off":
