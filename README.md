@@ -40,6 +40,8 @@ A mensagem de **"Tocando agora" tem botões** de pausar/retomar, pular e parar �
 
 O bot sai sozinho do canal após 5 minutos sem nada na fila, ou 1 minuto sozinho no canal.
 
+**Lives (lofi 24/7, festivais etc.):** funcionam no `/play` normalmente e aparecem como **🔴 AO VIVO**. Live engasga de vez em quando; o bot detecta quando o áudio para (~15–30 s) e reconecta sozinho com um link novo. Se a live cair/encerrar de verdade, ele desiste após algumas tentativas e avisa no chat.
+
 **Spotify:** apenas links de *faixa* (`open.spotify.com/track/...`) — o bot lê artista + nome e toca o equivalente do YouTube. Playlists/álbuns do Spotify precisariam de chave de API; use playlists do YouTube.
 
 **Sobre playlists e Mixes:** um link de *vídeo* que carrega um Mix/rádio junto (`&list=RD...`, `start_radio=1`) toca **apenas o vídeo**. Só links de *playlist* explícita (`youtube.com/playlist?list=...`) entram inteiros, limitados a 100 músicas por vez.
