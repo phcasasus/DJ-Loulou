@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 queue_state.json
 bot.log*
+.kiro/
