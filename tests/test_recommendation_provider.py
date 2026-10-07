@@ -87,9 +87,29 @@ async def test_provider_normalizes_recorded_ytdlp_candidate_after_filtering_curr
     assert recorded_extractor.calls == [
         (
             {**YTDL_RECOMMENDATION_OPTS, "playlistend": 10},
-            "https://www.youtube.com/watch?v=fonte-manual_01&list=RDfonte-manual_01",
+            "https://www.youtube.com/watch?v=fonte-manual_01&list=RDfonte-manual_01&start_radio=1",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_provider_synthesizes_page_url_for_flat_youtube_candidate():
+    """Entradas flat de um Mix devem ser reproduzíveis mesmo sem webpage_url."""
+    recorded_extractor = RecordedExtractor(
+        {
+            "entries": [
+                _youtube_entry("faixa-atual"),
+                {"id": "sem-pagina", "title": "Entrada flat"},
+            ]
+        }
+    )
+    provider = RecommendationProvider(extractor=recorded_extractor)
+
+    result = await provider.fetch_qualified(_source(), frozenset(), current_id="faixa-atual")
+
+    assert isinstance(result, RecommendationResult)
+    assert result.track.video_id == "sem-pagina"
+    assert result.track.url == "https://www.youtube.com/watch?v=sem-pagina"
 
 
 @pytest.mark.asyncio
@@ -99,7 +119,7 @@ async def test_provider_returns_no_qualified_recommendation_for_recorded_invalid
         {
             "entries": [
                 _youtube_entry("faixa-atual"),
-                {"id": "sem-pagina", "title": "Incompleta", "extractor_key": "Youtube"},
+                {"id": "id com espaco", "title": "Incompleta"},
                 {"id": "nao-youtube", "title": "Outra", "webpage_url": "https://example.test/video"},
             ]
         }
@@ -129,6 +149,6 @@ async def test_provider_returns_extractor_failure_without_network_when_fake_ytdl
     assert calls == [
         (
             {**YTDL_RECOMMENDATION_OPTS, "playlistend": 10},
-            "https://www.youtube.com/watch?v=fonte-manual_01&list=RDfonte-manual_01",
+            "https://www.youtube.com/watch?v=fonte-manual_01&list=RDfonte-manual_01&start_radio=1",
         )
     ]

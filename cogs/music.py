@@ -521,10 +521,13 @@ class TrackResolver:
         webpage_url = cls._page_url(info, fallback_url)
         provider = cls.provider(info, webpage_url or "")
         video_id = cls._video_id(info, provider)
-        if require_youtube and (provider != "youtube" or video_id is None or webpage_url is None):
-            return None
+        # Entradas ``extract_flat`` de Mix podem trazer apenas o ID e o extractor.
+        # Para YouTube, o ID é suficiente para construir a página canônica antes
+        # da validação obrigatória de recomendações.
         if provider == "youtube" and video_id and webpage_url is None:
             webpage_url = f"https://www.youtube.com/watch?v={video_id}"
+        if require_youtube and (provider != "youtube" or video_id is None or webpage_url is None):
+            return None
         if webpage_url is None:
             return None
         title = info.get("title")
@@ -594,8 +597,9 @@ class RecommendationProvider:
         video_id = source.video_id.strip()
         if not TrackResolver._YOUTUBE_ID_RE.fullmatch(video_id):
             return None
-        # A radio/Mix deriva apenas do ID normalizado, nunca de título ou texto do membro.
-        return f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+        # A rádio/Mix deriva apenas do ID normalizado. ``start_radio=1`` instrui
+        # o YouTube a materializar as recomendações, sem enfileirar o Mix inteiro.
+        return f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}&start_radio=1"
 
     def _options(self) -> dict:
         return {**YTDL_RECOMMENDATION_OPTS, "playlistend": self.candidate_limit}
@@ -639,7 +643,20 @@ class RecommendationProvider:
         if current_id:
             excluded.add(current_id)
         for entry in self._entries(info)[: self.candidate_limit]:
-            track = self._resolver.recommendation_track(entry)
+            # A resposta flat de uma rádio do YouTube pode conter somente ``id`` e
+            # ``title``. Como esta lista foi extraída de um Mix YouTube, um ID de
+            # vídeo válido identifica a página canônica sem depender de metadados
+            # que essa forma de resposta deliberadamente omite.
+            value = entry.get("id") or entry.get("video_id")
+            video_id = str(value).strip() if value is not None else ""
+            candidate = entry
+            if (
+                TrackResolver._YOUTUBE_ID_RE.fullmatch(video_id)
+                and not entry.get("webpage_url")
+                and not entry.get("original_url")
+            ):
+                candidate = {**entry, "webpage_url": f"https://www.youtube.com/watch?v={video_id}"}
+            track = self._resolver.recommendation_track(candidate)
             if track is not None and track.video_id not in excluded:
                 return RecommendationResult(track)
         return NoQualifiedRecommendation()
