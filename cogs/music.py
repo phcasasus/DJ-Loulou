@@ -1029,6 +1029,10 @@ class MusicPlayer:
             self.explicit_queue.clear()
             self.loop_mode = "off"
             self._last_finished = None
+            # Encerra a sessao atual de Autoplay para que o callback de parada nao
+            # selecione outra recomendacao depois de esvaziar a fila.
+            self.state.recommendation_source = None
+            self.state.automatic_history.clear()
             self.state.playback_version += 1
             self._recommendation_failure_version = None
             self._invalidate_recommendation_locked()
