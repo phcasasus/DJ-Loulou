@@ -1562,25 +1562,34 @@ class Music(commands.Cog):
                 return await interaction.followup.send(erro)
             busca = termo  # vira busca por nome no YouTube
 
+        busca = busca.strip()
+        if not busca:
+            return await interaction.followup.send("Informe o nome de uma musica ou um link.")
+
         vc = interaction.guild.voice_client
         if vc is None:
             await voice.channel.connect(self_deaf=True)
         elif vc.channel != voice.channel:
             await vc.move_to(voice.channel)
 
-        if busca.startswith(("http://", "https://")):
+        is_url = busca.startswith(("http://", "https://"))
+        if is_url:
             playlist = link_da_playlist(busca)
             if playlist:
                 busca = playlist
 
+        # O prefixo força a pesquisa no YouTube. Sem ele, buscas por nome dependem
+        # do comportamento implicito de ``default_search`` do yt-dlp.
+        is_url = busca.startswith(("http://", "https://"))
+        consulta = busca if is_url else f"ytsearch1:{busca}"
         try:
-            info = await asyncio.to_thread(_extract, YTDL_QUEUE_OPTS, busca)
+            info = await asyncio.to_thread(_extract, YTDL_QUEUE_OPTS, consulta)
         except yt_dlp.utils.DownloadError as exc:
+            log.warning("Falha ao resolver %s no /play: %s", "URL" if is_url else "busca", exc)
             return await interaction.followup.send(f"Nao consegui acessar isso. (`{exc}`)")
 
         requester_id = interaction.user.id
         requester_name = interaction.user.display_name
-        is_url = busca.startswith(("http://", "https://"))
         tracks: list[Track] = []
 
         def make_explicit_track(entry: dict, fallback_url: str | None) -> Track | None:
@@ -1596,7 +1605,10 @@ class Music(commands.Cog):
             if not is_url:
                 entries = entries[:1]  # busca por nome: usa o primeiro resultado
             for entry in entries:
-                track = make_explicit_track(entry, entry.get("webpage_url"))
+                # Entradas achatadas de busca/playlist podem expor a página apenas
+                # em ``url``. Nesse contexto não é URL temporária de stream.
+                fallback_url = entry.get("webpage_url") or entry.get("url")
+                track = make_explicit_track(entry, fallback_url)
                 if track is not None:
                     tracks.append(track)
         elif info:

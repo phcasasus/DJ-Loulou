@@ -208,13 +208,19 @@ async def test_play_and_playnext_during_automatic_choose_explicit_priority_after
     music.state_repository = repository
     music.ffmpeg = "ffmpeg"
 
+    queries: list[str] = []
+
     def extract(_options: dict[str, Any], query: str) -> dict[str, Any]:
+        queries.append(query)
+        video_id = query.removeprefix("ytsearch1:")
         return {
-            "id": query,
-            "title": f"Faixa {query}",
-            "duration": 180,
-            "extractor_key": "Youtube",
-            "webpage_url": f"https://www.youtube.com/watch?v={query}",
+            "entries": [{
+                "id": video_id,
+                "title": f"Faixa {video_id}",
+                "duration": 180,
+                # Resultado real de ytsearch com extract_flat pode trazer só url.
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+            }]
         }
 
     monkeypatch.setattr("cogs.music._extract", extract)
@@ -223,6 +229,7 @@ async def test_play_and_playnext_during_automatic_choose_explicit_priority_after
     await Music.playnext.callback(music, _command_interaction(fake_guild, fake_text_channel), "next-01")
     await Music.playnext.callback(music, _command_interaction(fake_guild, fake_text_channel), "next-02")
 
+    assert queries == ["ytsearch1:play-01", "ytsearch1:next-01", "ytsearch1:next-02"]
     assert [track.video_id for track in player.explicit_queue] == ["next-02", "next-01", "play-01"]
     if completion == "skip":
         await player.skip()
